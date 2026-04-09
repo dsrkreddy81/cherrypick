@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 
 from cherrypick.db.session import get_session
 from cherrypick.db.models import Business, Review
-from cherrypick.scraper.google_maps import scrape_reviews
+from cherrypick.scraper.google_maps import scrape_reviews, scrape_reviews_sync
 
 
 def _url_to_place_id(url: str) -> str:
@@ -41,7 +41,7 @@ def get_cached_business(url: str, max_age_days: int = 7) -> Business | None:
         session.close()
 
 
-async def scrape_and_store(
+def scrape_and_store(
     url: str, max_reviews: int = 500, force: bool = False
 ) -> Business:
     """Scrape reviews from Google Maps and store them in the database.
@@ -50,7 +50,7 @@ async def scrape_and_store(
     force=False, returns the cached Business without re-scraping.
 
     Args:
-        url: Full Google Maps URL for a business/place.
+        url: Full Google Maps URL or search query for a business.
         max_reviews: Maximum number of reviews to scrape.
         force: If True, always re-scrape regardless of cache.
 
@@ -62,7 +62,7 @@ async def scrape_and_store(
         if cached is not None:
             return cached
 
-    data = await scrape_reviews(url, max_reviews=max_reviews)
+    data = scrape_reviews_sync(url, max_reviews=max_reviews)
 
     session = get_session()
     try:

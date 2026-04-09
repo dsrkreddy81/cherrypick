@@ -1,44 +1,12 @@
 import streamlit as st
-import asyncio
-import sys
-import threading
 from dotenv import load_dotenv
-
-
-def run_async(coro):
-    """Run an async coroutine from Streamlit (which has its own event loop).
-    Playwright needs ProactorEventLoop on Windows for subprocess support."""
-    result = None
-    exception = None
-
-    def _run():
-        nonlocal result, exception
-        try:
-            if sys.platform == "win32":
-                asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                result = loop.run_until_complete(coro)
-            finally:
-                loop.close()
-        except Exception as e:
-            exception = e
-
-    thread = threading.Thread(target=_run)
-    thread.start()
-    thread.join()
-
-    if exception:
-        raise exception
-    return result
 
 load_dotenv()
 
 st.set_page_config(page_title="Compare — Cherry Pick", page_icon="🍒", layout="wide")
 st.title("🍒 Compare Businesses")
 
-st.write("Enter 2-3 Google Maps URLs to compare side by side.")
+st.write("Enter 2-3 Google Maps URLs or business names to compare side by side.")
 
 urls = []
 for i in range(3):
@@ -48,7 +16,6 @@ for i in range(3):
         urls.append(url)
 
 if st.button("Compare", type="primary", disabled=len(urls) < 2):
-    from cherrypick.scraper.url_parser import parse_google_maps_url
     from cherrypick.scraper.pipeline import scrape_and_store, get_cached_business
     from cherrypick.analysis.pipeline import analyze_business
     from cherrypick.db.session import get_session
@@ -58,18 +25,12 @@ if st.button("Compare", type="primary", disabled=len(urls) < 2):
     businesses = []
 
     for url in urls:
-        try:
-            parse_google_maps_url(url)
-        except ValueError as e:
-            st.error(f"Invalid URL: {url} — {e}")
-            st.stop()
-
         cached = get_cached_business(url)
         if cached:
             biz = cached
         else:
             with st.spinner(f"Scraping {url}..."):
-                biz = run_async(scrape_and_store(url))
+                biz = scrape_and_store(url)
 
         session = get_session()
         db_reviews = session.query(Review).filter_by(business_id=biz.id).all()

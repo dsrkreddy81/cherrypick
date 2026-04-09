@@ -1,37 +1,5 @@
 import streamlit as st
-import asyncio
-import sys
-import threading
 from dotenv import load_dotenv
-
-
-def run_async(coro):
-    """Run an async coroutine from Streamlit (which has its own event loop).
-    Playwright needs ProactorEventLoop on Windows for subprocess support."""
-    result = None
-    exception = None
-
-    def _run():
-        nonlocal result, exception
-        try:
-            if sys.platform == "win32":
-                asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                result = loop.run_until_complete(coro)
-            finally:
-                loop.close()
-        except Exception as e:
-            exception = e
-
-    thread = threading.Thread(target=_run)
-    thread.start()
-    thread.join()
-
-    if exception:
-        raise exception
-    return result
 
 load_dotenv()
 
@@ -41,22 +9,15 @@ st.title("🍒 Cherry Pick")
 st.subheader("Before you trust any business, Cherry Pick it.")
 
 url = st.text_input(
-    "Paste a Google Maps link",
-    placeholder="https://www.google.com/maps/place/...",
+    "Paste a Google Maps link or search for a business",
+    placeholder="https://www.google.com/maps/place/... or 'E Sushi Indianapolis'",
 )
 
 if st.button("Analyze", type="primary", disabled=not url):
-    from cherrypick.scraper.url_parser import parse_google_maps_url
     from cherrypick.scraper.pipeline import scrape_and_store, get_cached_business
     from cherrypick.analysis.pipeline import analyze_business
     from cherrypick.db.session import get_session
     from cherrypick.db.models import Review
-
-    try:
-        parse_google_maps_url(url)
-    except ValueError as e:
-        st.error(str(e))
-        st.stop()
 
     with st.spinner("Checking cache..."):
         cached = get_cached_business(url)
@@ -65,8 +26,8 @@ if st.button("Analyze", type="primary", disabled=not url):
         st.info(f"Found cached data for **{cached.name}** (scraped {cached.scraped_at.strftime('%Y-%m-%d')})")
         biz = cached
     else:
-        with st.spinner("Scraping reviews from Google Maps... This may take a few minutes."):
-            biz = run_async(scrape_and_store(url))
+        with st.spinner("Scraping reviews via Docker... This may take 1-2 minutes."):
+            biz = scrape_and_store(url)
         st.success(f"Scraped **{biz.name}** successfully!")
 
     session = get_session()
