@@ -1,34 +1,40 @@
-"""Google Maps review scraper using Crawl4AI.
+"""Google Maps review scraper using Playwright directly.
 
 Scrapes reviews from a Google Maps business listing by:
-1. Loading the page with a headless Chromium browser
-2. Clicking the Reviews tab
-3. Scrolling the reviews panel to load more reviews
-4. Expanding truncated review text
-5. Parsing the rendered HTML with BeautifulSoup
+1. Launching a stealth Chromium browser
+2. Navigating to the URL (handles short URL redirects)
+3. Clicking the Reviews tab
+4. Scrolling the reviews panel to load reviews
+5. Expanding truncated review text
+6. Extracting data via JS evaluation
 
-CSS selectors are placed in SELECTORS dict at the top for easy updating
+CSS selectors are in SELECTORS dict at the top for easy updating
 when Google changes their DOM structure.
 """
 
+import asyncio
+import random
 import re
 
-from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
+from playwright.async_api import async_playwright
+from playwright_stealth import Stealth
+
 
 # ----- CSS selectors (update when Google changes DOM) -----
 SELECTORS = {
     "reviews_tab": 'button[aria-label*="Reviews"]',
-    "reviews_tab_fallback": 'button[data-tab-index="1"]',
+    "reviews_tab_alt": 'button[data-tab-index="1"]',
     "review_container": "div.jftiEf",
+    "review_container_alt": "div[data-review-id]",
     "reviewer_name": "div.d4r55",
     "star_rating": "span.kvMYJc",
     "review_text": "span.wiI7pd",
     "review_date": "span.rsqaWe",
     "reviewer_reviews_count": "span.RfnDt",
-    "more_button": "button.w8nwRe.kyuRq",
+    "more_button": "button.w8nwRe",
     "scrollable_panel": "div.m6QErb.DxyBCb",
-    "scrollable_panel_fallback": 'div.m6QErb[role="feed"]',
-    "business_name": "h1.DUGVrf",
+    "scrollable_panel_alt": 'div.m6QErb[role="feed"]',
+    "business_name": "h1",
     "business_address": 'button[data-item-id="address"]',
     "business_category": 'button[jsaction*="category"]',
     "business_rating": "div.F7nice span[aria-hidden]",
@@ -40,285 +46,204 @@ async def scrape_reviews(url: str, max_reviews: int = 500) -> dict:
     """Scrape reviews from a Google Maps business listing.
 
     Args:
-        url: Full Google Maps URL for a business/place.
-        max_reviews: Maximum number of reviews to collect (caps scrolling).
+        url: Google Maps URL (full or short maps.app.goo.gl link).
+        max_reviews: Maximum number of reviews to collect.
 
     Returns:
-        Dict with keys: business_name, business_address, business_category,
+        Dict with business_name, business_address, business_category,
         google_rating, total_review_count, reviews (list of dicts).
     """
-    browser_config = BrowserConfig(
-        browser_type="chromium",
-        headless=True,
-        extra_args=[
-            "--disable-blink-features=AutomationControlled",
-            "--disable-features=VizDisplayCompositor",
-            "--no-sandbox",
-        ],
-    )
-
-    # Step 1: Load the page and wait for it to settle (handles short URL redirects).
-    # Do NOT use wait_for with a review selector here — reviews aren't visible
-    # until our JS clicks the Reviews tab.
-    load_config = CrawlerRunConfig(
-        cache_mode=CacheMode.BYPASS,
-        page_timeout=90000,
-        simulate_user=True,
-        override_navigator=True,
-        # Wait for the page to have a heading (business name) — proves it loaded
-        wait_for="css:h1",
-    )
-
-    scroll_js = _build_scroll_js(max_reviews)
-
-    # Step 2: After page loads, run JS to click Reviews tab + scroll
-    scroll_config = CrawlerRunConfig(
-        js_code=[scroll_js],
-        cache_mode=CacheMode.BYPASS,
-        page_timeout=120000,
-        simulate_user=True,
-        override_navigator=True,
-        session_id="cherrypick_scrape",
-    )
-
-    async with AsyncWebCrawler(config=browser_config) as crawler:
-        # First pass: load the page (handles redirects from short URLs)
-        result = await crawler.arun(
-            url=url,
-            config=CrawlerRunConfig(
-                cache_mode=CacheMode.BYPASS,
-                page_timeout=90000,
-                simulate_user=True,
-                override_navigator=True,
-                wait_for="css:h1",
-                session_id="cherrypick_scrape",
-            ),
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
         )
-        if not result.success:
-            raise RuntimeError(f"Failed to load {url}: {result.error_message}")
-
-        # Second pass: run the scroll JS on the already-loaded page
-        result = await crawler.arun(
-            url=result.url or url,  # use redirected URL if available
-            config=CrawlerRunConfig(
-                js_code=[scroll_js],
-                cache_mode=CacheMode.BYPASS,
-                page_timeout=120000,
-                simulate_user=True,
-                override_navigator=True,
-                session_id="cherrypick_scrape",
-            ),
+        context = await browser.new_context(
+            viewport={"width": 1280, "height": 900},
+            locale="en-US",
+            timezone_id="America/New_York",
         )
-        if not result.success:
-            raise RuntimeError(f"Failed to scrape reviews from {url}: {result.error_message}")
+        page = await context.new_page()
+        stealth = Stealth()
+        await stealth.apply_stealth_async(page)
 
-    return _parse_reviews_from_html(result.html)
-
-
-# ---- JavaScript helpers ----
-
-def _build_scroll_js(max_reviews: int) -> str:
-    """Return JS that clicks Reviews tab, expands 'More' buttons, and scrolls the reviews panel."""
-    return (
-        "(async () => {\n"
-        "    // Click Reviews tab\n"
-        "    const reviewsTab = document.querySelector('" + SELECTORS["reviews_tab"] + "')\n"
-        "        || document.querySelector('" + SELECTORS["reviews_tab_fallback"] + "');\n"
-        "    if (reviewsTab) {\n"
-        "        reviewsTab.click();\n"
-        "        await new Promise(r => setTimeout(r, 3000));\n"
-        "    }\n"
-        "\n"
-        "    // Locate the scrollable reviews panel\n"
-        "    const scrollable = document.querySelector('" + SELECTORS["scrollable_panel"] + "')\n"
-        "        || document.querySelector('" + SELECTORS["scrollable_panel_fallback"] + "');\n"
-        "\n"
-        "    if (scrollable) {\n"
-        "        let lastCount = 0;\n"
-        "        let sameCountStreak = 0;\n"
-        "        const maxReviews = " + str(max_reviews) + ";\n"
-        "\n"
-        "        for (let i = 0; i < 200; i++) {\n"
-        "            // Expand truncated reviews\n"
-        "            document.querySelectorAll('" + SELECTORS["more_button"] + "').forEach(b => b.click());\n"
-        "\n"
-        "            scrollable.scrollTop = scrollable.scrollHeight;\n"
-        "            await new Promise(r => setTimeout(r, 1500 + Math.random() * 2000));\n"
-        "\n"
-        "            const count = document.querySelectorAll('" + SELECTORS["review_container"] + "').length;\n"
-        "            if (maxReviews > 0 && count >= maxReviews) break;\n"
-        "            if (count === lastCount) {\n"
-        "                sameCountStreak++;\n"
-        "                if (sameCountStreak >= 3) break;\n"
-        "            } else {\n"
-        "                sameCountStreak = 0;\n"
-        "            }\n"
-        "            lastCount = count;\n"
-        "        }\n"
-        "        // Final expand of truncated reviews\n"
-        "        document.querySelectorAll('" + SELECTORS["more_button"] + "').forEach(b => b.click());\n"
-        "        await new Promise(r => setTimeout(r, 1000));\n"
-        "    }\n"
-        "})();"
-    )
-
-
-# ---- HTML parsers ----
-
-def _parse_reviews_from_html(html: str) -> dict:
-    """Parse review data from the scraped HTML.
-
-    Tries BeautifulSoup first, falls back to regex.
-    """
-    try:
-        from bs4 import BeautifulSoup  # noqa: F401
-        return _parse_with_bs4(html)
-    except ImportError:
-        return _parse_with_regex(html)
-
-
-def _parse_with_bs4(html: str) -> dict:
-    """Parse reviews using BeautifulSoup."""
-    from bs4 import BeautifulSoup
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    # Business metadata
-    name_el = soup.select_one(SELECTORS["business_name"])
-    business_name = name_el.get_text(strip=True) if name_el else None
-
-    address_el = soup.select_one(SELECTORS["business_address"])
-    business_address = address_el.get_text(strip=True) if address_el else None
-
-    category_el = soup.select_one(SELECTORS["business_category"])
-    business_category = category_el.get_text(strip=True) if category_el else None
-
-    rating_el = soup.select_one(SELECTORS["business_rating"])
-    google_rating = None
-    if rating_el:
         try:
-            google_rating = float(rating_el.get_text(strip=True).replace(",", "."))
-        except (ValueError, TypeError):
-            pass
+            # Step 1: Navigate (handles short URL redirects automatically)
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            # Wait for the page to actually render something
+            await page.wait_for_selector("h1", timeout=30000)
+            await asyncio.sleep(2)
 
-    total_count_el = soup.select_one(SELECTORS["total_review_count"])
-    total_review_count = None
-    if total_count_el:
-        label = total_count_el.get("aria-label", "")
-        count_match = re.search(r"([\d,]+)", label)
-        if count_match:
-            total_review_count = int(count_match.group(1).replace(",", ""))
+            # Step 2: Accept cookies if prompted
+            try:
+                accept_btn = page.locator('button:has-text("Accept all")')
+                if await accept_btn.count() > 0:
+                    await accept_btn.first.click()
+                    await asyncio.sleep(1)
+            except Exception:
+                pass
 
-    # Individual reviews
-    reviews = []
-    for container in soup.select(SELECTORS["review_container"]):
-        reviewer_name = None
-        name_el = container.select_one(SELECTORS["reviewer_name"])
-        if name_el:
-            reviewer_name = name_el.get_text(strip=True)
+            # Step 3: Click the Reviews tab
+            clicked = False
+            for selector in [SELECTORS["reviews_tab"], SELECTORS["reviews_tab_alt"]]:
+                try:
+                    tab = page.locator(selector)
+                    if await tab.count() > 0:
+                        await tab.first.click()
+                        clicked = True
+                        await asyncio.sleep(3)
+                        break
+                except Exception:
+                    continue
 
-        star_rating = None
-        rating_el = container.select_one(SELECTORS["star_rating"])
-        if rating_el:
-            aria = rating_el.get("aria-label", "")
-            m = re.search(r"(\d)", aria)
-            if m:
-                star_rating = int(m.group(1))
+            if not clicked:
+                # Try clicking anything that says "reviews" in text
+                try:
+                    tab = page.locator('button:has-text("Reviews")')
+                    if await tab.count() > 0:
+                        await tab.first.click()
+                        await asyncio.sleep(3)
+                except Exception:
+                    pass
 
-        review_text = ""
-        text_el = container.select_one(SELECTORS["review_text"])
-        if text_el:
-            review_text = text_el.get_text(strip=True)
+            # Step 4: Find the scrollable reviews panel and scroll
+            scrollable = None
+            for sel in [SELECTORS["scrollable_panel"], SELECTORS["scrollable_panel_alt"]]:
+                loc = page.locator(sel)
+                if await loc.count() > 0:
+                    scrollable = loc.first
+                    break
 
-        review_date = None
-        date_el = container.select_one(SELECTORS["review_date"])
-        if date_el:
-            review_date = date_el.get_text(strip=True)
+            if scrollable:
+                last_count = 0
+                same_count_streak = 0
 
-        reviewer_total_reviews = 1
-        count_el = container.select_one(SELECTORS["reviewer_reviews_count"])
-        if count_el:
-            count_text = count_el.get_text(strip=True)
-            m = re.search(r"(\d+)", count_text)
-            if m:
-                reviewer_total_reviews = int(m.group(1))
+                for _ in range(200):
+                    # Expand truncated reviews
+                    more_buttons = page.locator(SELECTORS["more_button"])
+                    count = await more_buttons.count()
+                    for i in range(count):
+                        try:
+                            await more_buttons.nth(i).click(timeout=500)
+                        except Exception:
+                            pass
 
-        if star_rating is not None:
-            reviews.append({
-                "reviewer_name": reviewer_name,
-                "star_rating": star_rating,
-                "review_text": review_text,
-                "review_date": review_date,
-                "reviewer_total_reviews": reviewer_total_reviews,
-                "photo_count": 0,
-            })
+                    # Scroll down
+                    await scrollable.evaluate("el => el.scrollTop = el.scrollHeight")
+                    await asyncio.sleep(1.5 + random.random() * 2)
 
-    return {
-        "business_name": business_name,
-        "business_address": business_address,
-        "business_category": business_category,
-        "google_rating": google_rating,
-        "total_review_count": total_review_count if total_review_count else len(reviews),
-        "reviews": reviews,
-    }
+                    # Count reviews loaded
+                    review_count = 0
+                    for sel in [SELECTORS["review_container"], SELECTORS["review_container_alt"]]:
+                        c = await page.locator(sel).count()
+                        if c > review_count:
+                            review_count = c
+
+                    if max_reviews > 0 and review_count >= max_reviews:
+                        break
+                    if review_count == last_count:
+                        same_count_streak += 1
+                        if same_count_streak >= 3:
+                            break
+                    else:
+                        same_count_streak = 0
+                    last_count = review_count
+
+                # Final expand of truncated text
+                more_buttons = page.locator(SELECTORS["more_button"])
+                for i in range(await more_buttons.count()):
+                    try:
+                        await more_buttons.nth(i).click(timeout=500)
+                    except Exception:
+                        pass
+                await asyncio.sleep(1)
+
+            # Step 5: Extract all data via JS
+            data = await page.evaluate(_extraction_js())
+
+            return data
+
+        finally:
+            await browser.close()
 
 
-def _parse_with_regex(html: str) -> dict:
-    """Fallback parser using regex on the rendered HTML.
+def _extraction_js() -> str:
+    """Return JS that extracts business info + reviews from the loaded page."""
+    return """() => {
+        const data = {
+            business_name: null,
+            business_address: null,
+            business_category: null,
+            google_rating: null,
+            total_review_count: 0,
+            reviews: [],
+        };
 
-    Less reliable than BeautifulSoup but works without extra dependencies.
-    """
-    # Extract business name
-    name_match = re.search(r'<h1[^>]*class="[^"]*DUGVrf[^"]*"[^>]*>(.*?)</h1>', html)
-    business_name = name_match.group(1).strip() if name_match else None
+        // Business metadata
+        const h1 = document.querySelector('h1');
+        if (h1) data.business_name = h1.textContent.trim();
 
-    # Extract reviews
-    reviews = []
-    review_blocks = re.findall(
-        r'data-review-id="[^"]*"(.*?)(?=data-review-id|$)', html, re.DOTALL
-    )
+        const addrBtn = document.querySelector('button[data-item-id="address"]');
+        if (addrBtn) data.business_address = addrBtn.textContent.trim();
 
-    for block in review_blocks:
-        reviewer_name = None
-        nm = re.search(r'class="[^"]*d4r55[^"]*"[^>]*>(.*?)</div>', block)
-        if nm:
-            reviewer_name = re.sub(r"<[^>]+>", "", nm.group(1)).strip()
+        const catBtn = document.querySelector('button[jsaction*="category"]');
+        if (catBtn) data.business_category = catBtn.textContent.trim();
 
-        star_rating = None
-        rm = re.search(r'aria-label="(\d)\s*star', block)
-        if rm:
-            star_rating = int(rm.group(1))
+        const ratingEl = document.querySelector('div.F7nice span[aria-hidden]');
+        if (ratingEl) {
+            const val = parseFloat(ratingEl.textContent.replace(',', '.'));
+            if (!isNaN(val)) data.google_rating = val;
+        }
 
-        review_text = ""
-        tm = re.search(r'class="[^"]*wiI7pd[^"]*"[^>]*>(.*?)</span>', block, re.DOTALL)
-        if tm:
-            review_text = re.sub(r"<[^>]+>", "", tm.group(1)).strip()
+        const countEl = document.querySelector('span[aria-label*="reviews"]');
+        if (countEl) {
+            const m = countEl.getAttribute('aria-label')?.match(/([\\d,]+)/);
+            if (m) data.total_review_count = parseInt(m[1].replace(/,/g, ''));
+        }
 
-        review_date = None
-        dm = re.search(r'class="[^"]*rsqaWe[^"]*"[^>]*>(.*?)</span>', block)
-        if dm:
-            review_date = re.sub(r"<[^>]+>", "", dm.group(1)).strip()
+        // Reviews — try multiple container selectors
+        const containers = document.querySelectorAll('div.jftiEf')?.length
+            ? document.querySelectorAll('div.jftiEf')
+            : document.querySelectorAll('div[data-review-id]');
 
-        reviewer_total_reviews = 1
-        cm = re.search(r"(\d+)\s*review", block)
-        if cm:
-            reviewer_total_reviews = int(cm.group(1))
+        containers.forEach(el => {
+            const nameEl = el.querySelector('div.d4r55');
+            const ratingEl = el.querySelector('span.kvMYJc')
+                || el.querySelector('span[role="img"]');
+            const textEl = el.querySelector('span.wiI7pd');
+            const dateEl = el.querySelector('span.rsqaWe');
+            const countEl = el.querySelector('span.RfnDt');
 
-        if star_rating is not None:
-            reviews.append({
-                "reviewer_name": reviewer_name,
-                "star_rating": star_rating,
-                "review_text": review_text,
-                "review_date": review_date,
-                "reviewer_total_reviews": reviewer_total_reviews,
-                "photo_count": 0,
-            })
+            let starRating = null;
+            if (ratingEl) {
+                const aria = ratingEl.getAttribute('aria-label') || '';
+                const m = aria.match(/(\\d)/);
+                if (m) starRating = parseInt(m[1]);
+            }
 
-    return {
-        "business_name": business_name,
-        "business_address": None,
-        "business_category": None,
-        "google_rating": None,
-        "total_review_count": len(reviews),
-        "reviews": reviews,
-    }
+            let reviewerCount = 1;
+            if (countEl) {
+                const m = countEl.textContent.match(/(\\d+)/);
+                if (m) reviewerCount = parseInt(m[1]);
+            }
+
+            if (starRating !== null) {
+                data.reviews.push({
+                    reviewer_name: nameEl ? nameEl.textContent.trim() : null,
+                    star_rating: starRating,
+                    review_text: textEl ? textEl.textContent.trim() : '',
+                    review_date: dateEl ? dateEl.textContent.trim() : null,
+                    reviewer_total_reviews: reviewerCount,
+                    photo_count: 0,
+                });
+            }
+        });
+
+        if (!data.total_review_count) data.total_review_count = data.reviews.length;
+
+        return data;
+    }"""
