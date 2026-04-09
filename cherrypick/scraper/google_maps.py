@@ -57,21 +57,60 @@ async def scrape_reviews(url: str, max_reviews: int = 500) -> dict:
         ],
     )
 
-    scroll_js = _build_scroll_js(max_reviews)
-
-    run_config = CrawlerRunConfig(
-        js_code=[scroll_js],
-        wait_for=f"css:{SELECTORS['review_container']}",
+    # Step 1: Load the page and wait for it to settle (handles short URL redirects).
+    # Do NOT use wait_for with a review selector here — reviews aren't visible
+    # until our JS clicks the Reviews tab.
+    load_config = CrawlerRunConfig(
         cache_mode=CacheMode.BYPASS,
-        page_timeout=60000,
+        page_timeout=90000,
         simulate_user=True,
         override_navigator=True,
+        # Wait for the page to have a heading (business name) — proves it loaded
+        wait_for="css:h1",
+    )
+
+    scroll_js = _build_scroll_js(max_reviews)
+
+    # Step 2: After page loads, run JS to click Reviews tab + scroll
+    scroll_config = CrawlerRunConfig(
+        js_code=[scroll_js],
+        cache_mode=CacheMode.BYPASS,
+        page_timeout=120000,
+        simulate_user=True,
+        override_navigator=True,
+        session_id="cherrypick_scrape",
     )
 
     async with AsyncWebCrawler(config=browser_config) as crawler:
-        result = await crawler.arun(url=url, config=run_config)
+        # First pass: load the page (handles redirects from short URLs)
+        result = await crawler.arun(
+            url=url,
+            config=CrawlerRunConfig(
+                cache_mode=CacheMode.BYPASS,
+                page_timeout=90000,
+                simulate_user=True,
+                override_navigator=True,
+                wait_for="css:h1",
+                session_id="cherrypick_scrape",
+            ),
+        )
         if not result.success:
-            raise RuntimeError(f"Failed to crawl {url}: {result.error_message}")
+            raise RuntimeError(f"Failed to load {url}: {result.error_message}")
+
+        # Second pass: run the scroll JS on the already-loaded page
+        result = await crawler.arun(
+            url=result.url or url,  # use redirected URL if available
+            config=CrawlerRunConfig(
+                js_code=[scroll_js],
+                cache_mode=CacheMode.BYPASS,
+                page_timeout=120000,
+                simulate_user=True,
+                override_navigator=True,
+                session_id="cherrypick_scrape",
+            ),
+        )
+        if not result.success:
+            raise RuntimeError(f"Failed to scrape reviews from {url}: {result.error_message}")
 
     return _parse_reviews_from_html(result.html)
 
